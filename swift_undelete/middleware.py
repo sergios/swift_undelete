@@ -34,9 +34,9 @@ Caveats:
    unable to delete it. In extremely full clusters, this may result in a
    situation where you need to add capacity before you can delete objects.
 
-Future work:
+ * Requires Swift 1.12.0+, which introduced system metadata.
 
- * Allow undelete to be enabled only for particular accounts or containers
+Future work:
 
  * Move to separate account, not container, for trash. This requires Swift to
    allow cross-account COPY requests.
@@ -46,9 +46,14 @@ Future work:
 
 """
 from swift.common import http, swob, utils, wsgi
+from swift.common.request_helpers import get_sys_meta_prefix
+from swift.proxy.controllers.base import get_account_info, get_container_info
 
 DEFAULT_TRASH_PREFIX = ".trash-"
 DEFAULT_TRASH_LIFETIME = 86400 * 90  # 90 days expressed in seconds
+SYSMETA_UNDELETE_ENABLED = "undelete-enabled"
+SYSMETA_ACCOUNT = get_sys_meta_prefix('account') + SYSMETA_UNDELETE_ENABLED
+SYSMETA_CONTAINER = get_sys_meta_prefix('container') + SYSMETA_UNDELETE_ENABLED
 
 
 try:
@@ -152,21 +157,35 @@ class CopyContext(wsgi.WSGIContext):
 class UndeleteMiddleware(object):
     def __init__(self, app, trash_prefix=DEFAULT_TRASH_PREFIX,
                  trash_lifetime=DEFAULT_TRASH_LIFETIME,
-                 block_trash_deletes=False):
+                 block_trash_deletes=False,
+                 enable_by_default=True):
         self.app = app
         self.trash_prefix = trash_prefix
         self.trash_lifetime = trash_lifetime
         self.block_trash_deletes = block_trash_deletes
+        self.enable_by_default = enable_by_default
 
     @swob.wsgify
     def __call__(self, req):
+        try:
+            vrs, acc, con, obj = req.split_path(2, 4, rest_with_last=True)
+        except ValueError:
+            # /info or similar...
+            return self.app
+
+        # Check if it's an account request...
+        if con is None:
+            return self.translate_sysmeta_and_complete(req, {
+                'x-' + SYSMETA_UNDELETE_ENABLED: SYSMETA_ACCOUNT})
+
+        # ...or a container request...
+        if obj is None:
+            return self.translate_sysmeta_and_complete(req, {
+                'x-' + SYSMETA_UNDELETE_ENABLED: SYSMETA_CONTAINER})
+
+        # ...must be object.
         # We only want to step in on object DELETE requests
         if req.method != 'DELETE':
-            return self.app
-        try:
-            vrs, acc, con, obj = req.split_path(4, 4, rest_with_last=True)
-        except ValueError:
-            # not an object request
             return self.app
 
         # Okay, this is definitely an object DELETE request; let's see if it's
@@ -199,6 +218,32 @@ class UndeleteMiddleware(object):
                 headers=copy_headers)
         return self.app
 
+    def translate_sysmeta_and_complete(self, req, mapping):
+        """
+        Translate some client HTTP headers to sysmeta headers (if superuser),
+        pass the request down the pipeline, and translate sysmeta headers back
+        to HTTP headers (for all users).
+
+        :param req: the request thus far
+        :param mapping: a mapping of HTTP headers to sysmeta headers
+        """
+        if self.is_superuser(req.environ):
+            for client_header, sysmeta_header in mapping.items():
+                val = req.headers.get(client_header)
+                if val is None:
+                    pass
+                elif utils.config_true_value(val):
+                    req.headers[sysmeta_header] = 'True'
+                elif val.lower() == 'default':
+                    req.headers[sysmeta_header] = ''
+                else:
+                    req.headers[sysmeta_header] = 'False'
+        resp = req.get_response(self.app)
+        for client_header, sysmeta_header in mapping.items():
+            if sysmeta_header in resp.headers:
+                resp.headers[client_header] = resp.headers[sysmeta_header]
+        return resp
+
     def copy_object(self, req, trash_container, obj):
         return CopyContext(self.app).copy(req.environ, trash_container, obj,
                                           self.trash_lifetime)
@@ -227,13 +272,28 @@ class UndeleteMiddleware(object):
         """
         return bool(env.get('reseller_request'))
 
+    def is_enabled_for(self, env):
+        """
+        Whether an account or container has meta-data to opt out of undelete
+        protection
+        """
+        sysmeta_c = get_container_info(env, self.app)['sysmeta']
+        # Container info gets & caches account info, so this is basically free
+        sysmeta_a = get_account_info(env, self.app)['sysmeta']
+
+        enabled = sysmeta_c.get(SYSMETA_UNDELETE_ENABLED)
+        if enabled is None:
+            enabled = sysmeta_a.get(SYSMETA_UNDELETE_ENABLED,
+                                    self.enable_by_default)
+        return utils.config_true_value(enabled)
+
     def should_save_copy(self, env, con, obj):
         """
         Determine whether or not we should save a copy of the object prior to
         its deletion. For example, if the object is one that's in a trash
         container, don't save a copy lest we get infinite metatrash recursion.
         """
-        return not self.is_trash(con)
+        return not self.is_trash(con) and self.is_enabled_for(env)
 
 
 def filter_factory(global_conf, **local_conf):
@@ -247,6 +307,13 @@ def filter_factory(global_conf, **local_conf):
     # how long, in seconds, trash objects should live before expiring. Set to 0
     # to keep trash objects forever.
     trash_lifetime = 7776000  # 90 days
+    # whether to block trash objects from being deleted
+    block_trash_deletes = no
+    # whether to enable undelete functionality by default. Administrators may
+    # explicitly enable or disable per account or container via the
+    # X-Undelete-Enabled header. Set this header to 'default' to resume default
+    # behavior.
+    enable_by_default = yes
     """
     conf = global_conf.copy()
     conf.update(local_conf)
@@ -254,10 +321,13 @@ def filter_factory(global_conf, **local_conf):
     trash_prefix = conf.get("trash_prefix", DEFAULT_TRASH_PREFIX)
     trash_lifetime = int(conf.get("trash_lifetime", DEFAULT_TRASH_LIFETIME))
     block_trash_deletes = utils.config_true_value(
-        conf.get('block_trash_deletes', 'off'))
+        conf.get('block_trash_deletes', 'no'))
+    enable_by_default = utils.config_true_value(
+        conf.get('enable_by_default', 'yes'))
 
     def filt(app):
         return UndeleteMiddleware(app, trash_prefix=trash_prefix,
                                   trash_lifetime=trash_lifetime,
-                                  block_trash_deletes=block_trash_deletes)
+                                  block_trash_deletes=block_trash_deletes,
+                                  enable_by_default=enable_by_default)
     return filt

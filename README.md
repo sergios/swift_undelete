@@ -19,9 +19,9 @@ Caveats:
    unable to delete it. In extremely full clusters, this may result in a
    situation where you need to add capacity before you can delete objects.
 
-Future work:
+ * Requires Swift 1.12.0+, which introduced system metadata.
 
- * Allow undelete to be enabled only for particular accounts or containers
+Future work:
 
  * Move to separate account, not container, for trash. This requires Swift to
    allow cross-account COPY requests.

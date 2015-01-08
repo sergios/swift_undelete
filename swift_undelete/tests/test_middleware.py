@@ -40,6 +40,7 @@ class FakeApp(object):
 
         status = resp['status']
         headers = resp.get('headers', [])
+        env.update(resp.get('environ', {}))
         body_iter = resp.get('body_iter', [])
         start_response(status, headers)
         return body_iter
@@ -127,40 +128,72 @@ class MiddlewareTestCase(unittest.TestCase):
             return status[0], headerdict, body
 
 
+def with_req(path, method, headers=None, as_superuser=False):
+    def decorator(func):
+        def wrapped(*args, **kwargs):
+            req = swob.Request.blank(path)
+            req.method = method
+            if headers:
+                req.headers.update(headers)
+            if as_superuser:
+                req.environ['reseller_request'] = True
+            kwargs['req'] = req
+            return func(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
 class TestPassthrough(MiddlewareTestCase):
-    def test_account_passthrough(self):
+    @with_req('/v1/a', 'DELETE')
+    def test_account_passthrough(self, req):
         """
         Account requests are passed through unmodified.
         """
         self.app.responses = [{'status': '200 OK'}]
 
-        req = swob.Request.blank('/v1/a')
-        req.method = 'DELETE'
-
         status, _, _ = self.call_mware(req)
         self.assertEqual(status, "200 OK")
         self.assertEqual(self.app.calls, [('DELETE', '/v1/a')])
 
-    def test_container_passthrough(self):
+    @with_req('/v1/a/c', 'DELETE')
+    def test_container_passthrough(self, req):
         """
         Container requests are passed through unmodified.
         """
         self.app.responses = [{'status': '200 OK'}]
-        req = swob.Request.blank('/v1/a/c')
-        req.method = 'DELETE'
 
         status, _, _ = self.call_mware(req)
         self.assertEqual(status, "200 OK")
         self.assertEqual(self.app.calls, [('DELETE', '/v1/a/c')])
 
+    @with_req('/v1/a/c/o', 'PUT')
+    def test_object_passthrough(self, req):
+        """
+        Container requests are passed through unmodified.
+        """
+        self.app.responses = [{'status': '201 Created'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(self.app.calls, [('PUT', '/v1/a/c/o')])
+
 
 class TestObjectDeletion(MiddlewareTestCase):
-    def test_deleting_nonexistent_object(self):
+    @with_req('/v1/a/elements/Cf', 'DELETE')
+    def test_deleting_nonexistent_object(self, req):
         # If the object isn't there, ignore the 404 on COPY and pass the
         # DELETE request through. It might be an expired object, in which case
         # the object DELETE will actually get it out of the container listing
         # and free up some space.
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/a': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/a/elements': {
+                 'status': 200, 'sysmeta': {}}}},
             # COPY request
             {'status': '404 Not Found'},
             # trash-versions container creation request
@@ -177,22 +210,105 @@ class TestObjectDeletion(MiddlewareTestCase):
             {'status': '404 Not Found',
              'headers': [('X-Exophagous', 'ungrassed')]}]
 
-        req = swob.Request.blank('/v1/a/elements/Cf')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "404 Not Found")
         self.assertEqual(headers.get('X-Exophagous'), 'ungrassed')
-        self.assertEqual(self.app.calls,
-                         [('COPY', '/v1/a/elements/Cf'),
-                          ('PUT', '/v1/a/.trash-elements-versions'),
-                          ('PUT', '/v1/a/.trash-elements'),
-                          ('COPY', '/v1/a/elements/Cf'),
-                          ('DELETE', '/v1/a/elements/Cf')])
+        self.assertEqual(self.app.calls, [
+            ('HEAD', '/v1/a'),
+            ('HEAD', '/v1/a/elements'),
+            ('COPY', '/v1/a/elements/Cf'),
+            ('PUT', '/v1/a/.trash-elements-versions'),
+            ('PUT', '/v1/a/.trash-elements'),
+            ('COPY', '/v1/a/elements/Cf'),
+            ('DELETE', '/v1/a/elements/Cf')])
 
-    def test_copy_to_existing_trash_container(self):
+    @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
+    def test_delete_with_opted_out_container(self, req):
+        self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/MY_account': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/MY_account/cats': {
+                 'status': 200, 'sysmeta': {'undelete-enabled': 'False'}}}},
+            # DELETE request
+            {'status': '204 No Content',
+             'headers': [('X-Decadation', 'coprose')]}]
+
+        status, headers, body = self.call_mware(req)
+        self.assertEqual(status, "204 No Content")
+        self.assertEqual(headers['X-Decadation'], 'coprose')
+
+        self.assertEqual(3, len(self.app.calls))
+
+        # First, we check that the account and container for opt-out
+        method, path = self.app.calls[0]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account')
+
+        method, path = self.app.calls[1]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account/cats')
+
+        # Since the container opted out, no COPY request; we skip straight to
+        # performing the DELETE request (and send that response to the client
+        # unaltered)
+        method, path, headers = self.app.calls_with_headers[2]
+        self.assertEqual(method, 'DELETE')
+        self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
+
+    @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
+    def test_delete_with_opted_out_account(self, req):
+        self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/MY_account': {
+                 'status': 200, 'sysmeta': {'undelete-enabled': 'False'}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/MY_account/cats': {
+                 'status': 200, 'sysmeta': {}}}},
+            # DELETE request
+            {'status': '204 No Content',
+             'headers': [('X-Decadation', 'coprose')]}]
+
+        status, headers, body = self.call_mware(req)
+        self.assertEqual(status, "204 No Content")
+        self.assertEqual(headers['X-Decadation'], 'coprose')
+
+        self.assertEqual(3, len(self.app.calls))
+
+        # First, we check that the account and container for opt-out
+        method, path = self.app.calls[0]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account')
+
+        # First, we check that the account and container for opt-out
+        method, path = self.app.calls[1]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account/cats')
+
+        # Since the account opted out, no COPY request;
+        # we skip straight to performing the DELETE request (and send that
+        # response to the client unaltered)
+        method, path, headers = self.app.calls_with_headers[2]
+        self.assertEqual(method, 'DELETE')
+        self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
+
+    @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
+    def test_copy_to_existing_trash_container(self, req):
         self.undelete.trash_lifetime = 1997339
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/MY_account': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/MY_account/cats': {
+                 'status': 200, 'sysmeta': {}}}},
             # COPY request
             {'status': '201 Created',
              'headers': [('X-Sir-Not-Appearing-In-This-Response', 'yup')]},
@@ -200,52 +316,82 @@ class TestObjectDeletion(MiddlewareTestCase):
             {'status': '204 No Content',
              'headers': [('X-Decadation', 'coprose')]}]
 
-        req = swob.Request.blank('/v1/MY_account/cats/kittens.jpg')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
         # the client gets whatever the DELETE coughed up
         self.assertNotIn('X-Sir-Not-Appearing-In-This-Response', headers)
         self.assertEqual(headers['X-Decadation'], 'coprose')
 
-        self.assertEqual(2, len(self.app.calls))
+        self.assertEqual(4, len(self.app.calls))
 
-        # First, we performed a COPY request to save the object into the trash.
-        method, path, headers = self.app.calls_with_headers[0]
+        # First, we check that the account and container haven't opted out
+        method, path = self.app.calls[0]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account')
+
+        method, path = self.app.calls[1]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account/cats')
+
+        # Second, we performed a COPY request to save the object into the trash
+        method, path, headers = self.app.calls_with_headers[2]
         self.assertEqual(method, 'COPY')
         self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
         self.assertEqual(headers['Destination'], '.trash-cats/kittens.jpg')
         self.assertEqual(headers['X-Delete-After'], str(1997339))
 
-        # Second, we actually perform the DELETE request (and send that
+        # Finally, we actually perform the DELETE request (and send that
         # response to the client unaltered)
-        method, path, headers = self.app.calls_with_headers[1]
+        method, path, headers = self.app.calls_with_headers[3]
         self.assertEqual(method, 'DELETE')
         self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
 
-    def test_copy_to_existing_trash_container_no_expiration(self):
+    @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
+    def test_copy_to_existing_trash_container_no_expiration(self, req):
         self.undelete.trash_lifetime = 0
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/MY_account': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/MY_account/cats': {
+                 'status': 200, 'sysmeta': {}}}},
             # COPY request
             {'status': '201 Created'},
             # DELETE request
             {'status': '204 No Content'}]
 
-        req = swob.Request.blank('/v1/MY_account/cats/kittens.jpg')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
-        self.assertEqual(2, len(self.app.calls))
+        self.assertEqual(4, len(self.app.calls))
 
-        method, path, headers = self.app.calls_with_headers[0]
+        # First, we check that the account and container haven't opted out
+        method, path = self.app.calls[0]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account')
+
+        method, path = self.app.calls[1]
+        self.assertEqual(method, 'HEAD')
+        self.assertEqual(path, '/v1/MY_account/cats')
+
+        method, path, headers = self.app.calls_with_headers[2]
         self.assertEqual(method, 'COPY')
         self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
         self.assertNotIn('X-Delete-After', headers)
 
-    def test_copy_to_missing_trash_container(self):
+    @with_req('/v1/a/elements/Lv', 'DELETE')
+    def test_copy_to_missing_trash_container(self, req):
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/a': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/a/elements': {
+                 'status': 200, 'sysmeta': {}}}},
             # first COPY attempt: trash container doesn't exist
             {'status': '404 Not Found'},
             # trash-versions container creation request
@@ -257,36 +403,53 @@ class TestObjectDeletion(MiddlewareTestCase):
             # DELETE request
             {'status': '204 No Content'}]
 
-        req = swob.Request.blank('/v1/a/elements/Lv')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
-        self.assertEqual(self.app.calls,
-                         [('COPY', '/v1/a/elements/Lv'),
-                          ('PUT', '/v1/a/.trash-elements-versions'),
-                          ('PUT', '/v1/a/.trash-elements'),
-                          ('COPY', '/v1/a/elements/Lv'),
-                          ('DELETE', '/v1/a/elements/Lv')])
+        self.assertEqual(self.app.calls, [
+            ('HEAD', '/v1/a'),
+            ('HEAD', '/v1/a/elements'),
+            ('COPY', '/v1/a/elements/Lv'),
+            ('PUT', '/v1/a/.trash-elements-versions'),
+            ('PUT', '/v1/a/.trash-elements'),
+            ('COPY', '/v1/a/elements/Lv'),
+            ('DELETE', '/v1/a/elements/Lv')])
 
-    def test_copy_error(self):
+    @with_req('/v1/a/elements/Te', 'DELETE')
+    def test_copy_error(self, req):
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/a': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/a/elements': {
+                 'status': 200, 'sysmeta': {}}}},
             # COPY attempt: some mysterious error with some headers
             {'status': '503 Service Unavailable',
              'headers': [('X-Scraggedness', 'Goclenian')],
              'body_iter': ['dunno what happened boss']}]
 
-        req = swob.Request.blank('/v1/a/elements/Te')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "503 Service Unavailable")
         self.assertEqual(headers.get('X-Scraggedness'), 'Goclenian')
         self.assertIn('what happened', body)
-        self.assertEqual(self.app.calls, [('COPY', '/v1/a/elements/Te')])
+        self.assertEqual(self.app.calls, [
+            ('HEAD', '/v1/a'),
+            ('HEAD', '/v1/a/elements'),
+            ('COPY', '/v1/a/elements/Te')])
 
-    def test_copy_missing_trash_container_error_creating_vrs_container(self):
+    @with_req('/v1/a/elements/U', 'DELETE')
+    def test_copy_missing_trash_cont_error_creating_vrs_container(self, req):
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/a': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/a/elements': {
+                 'status': 200, 'sysmeta': {}}}},
             # first COPY attempt: trash container doesn't exist
             {'status': '404 Not Found'},
             # trash-versions container creation request: failure!
@@ -294,19 +457,27 @@ class TestObjectDeletion(MiddlewareTestCase):
              'headers': [('X-Pupillidae', 'Barry')],
              'body_iter': ['oh hell no']}]
 
-        req = swob.Request.blank('/v1/a/elements/U')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "403 Forbidden")
         self.assertEqual(headers.get('X-Pupillidae'), 'Barry')
         self.assertIn('oh hell no', body)
-        self.assertEqual(self.app.calls,
-                         [('COPY', '/v1/a/elements/U'),
-                          ('PUT', '/v1/a/.trash-elements-versions')])
+        self.assertEqual(self.app.calls, [
+            ('HEAD', '/v1/a'),
+            ('HEAD', '/v1/a/elements'),
+            ('COPY', '/v1/a/elements/U'),
+            ('PUT', '/v1/a/.trash-elements-versions')])
 
-    def test_copy_missing_trash_container_error_creating_container(self):
+    @with_req('/v1/a/elements/Mo', 'DELETE')
+    def test_copy_missing_trash_container_error_creating_container(self, req):
         self.app.responses = [
+            # account HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.account/a': {
+                 'status': 200, 'sysmeta': {}}}},
+            # container HEAD request
+            {'status': '200 OK',
+             'environ': {'swift.container/a/elements': {
+                 'status': 200, 'sysmeta': {}}}},
             # first COPY attempt: trash container doesn't exist
             {'status': '404 Not Found'},
             # trash-versions container creation request
@@ -316,53 +487,147 @@ class TestObjectDeletion(MiddlewareTestCase):
              'headers': [('X-Body-Type', 'short and stout')],
              'body_iter': ['here is my handle, here is my spout']}]
 
-        req = swob.Request.blank('/v1/a/elements/Mo')
-        req.method = 'DELETE'
-
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "418 I'm a teapot")
         self.assertEqual(headers.get('X-Body-Type'), 'short and stout')
         self.assertIn('spout', body)
-        self.assertEqual(self.app.calls,
-                         [('COPY', '/v1/a/elements/Mo'),
-                          ('PUT', '/v1/a/.trash-elements-versions'),
-                          ('PUT', '/v1/a/.trash-elements')])
+        self.assertEqual(self.app.calls, [
+            ('HEAD', '/v1/a'),
+            ('HEAD', '/v1/a/elements'),
+            ('COPY', '/v1/a/elements/Mo'),
+            ('PUT', '/v1/a/.trash-elements-versions'),
+            ('PUT', '/v1/a/.trash-elements')])
 
-    def test_delete_from_trash_as_non_superuser(self):
+    @with_req('/v1/a/.trash-borkbork/bork', 'DELETE')
+    def test_delete_from_trash_as_non_superuser(self, req):
         """
         Objects in trash containers can only be deleted by superusers.
         """
         self.app.responses = [{'status': '204 No Content'}]
-        req = swob.Request.blank('/v1/a/.trash-borkbork/bork')
-        req.method = 'DELETE'
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "403 Forbidden")
         self.assertEqual(self.app.calls, [])
 
-    def test_delete_from_trash_as_superuser(self):
+    @with_req('/v1/a/.trash-borkbork/bork', 'DELETE', as_superuser=True)
+    def test_delete_from_trash_as_superuser(self, req):
         """
         Objects in trash containers don't get saved.
         """
         self.app.responses = [{'status': '204 No Content'}]
-        req = swob.Request.blank('/v1/a/.trash-borkbork/bork')
-        req.method = 'DELETE'
-        req.environ['reseller_request'] = True
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
         self.assertEqual(self.app.calls,
                          [('DELETE', '/v1/a/.trash-borkbork/bork')])
 
-    def test_delete_from_trash_blocked(self):
+    @with_req('/v1/a/.trash-borkbork/bork', 'DELETE', as_superuser=True)
+    def test_delete_from_trash_blocked(self, req):
         self.undelete.block_trash_deletes = True
-        req = swob.Request.blank('/v1/a/.trash-borkbork/bork')
-        req.method = 'DELETE'
-        req.environ['reseller_request'] = True
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(self.app.calls, [])
+
+
+class TestSysmetaPassthrough(MiddlewareTestCase):
+    @with_req('/v1/a', 'POST', {
+        'x-undelete-enabled': 'foo'}, as_superuser=True)
+    def test_account_passthrough_to_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls_with_headers, [('POST', '/v1/a', {
+            'X-Undelete-Enabled': 'foo',
+            'X-Account-Sysmeta-Undelete-Enabled': 'False',
+            'Host': 'localhost:80'})])
+
+    @with_req('/v1/a', 'POST', {
+        'x-undelete-enabled': 'yes'}, as_superuser=True)
+    def test_account_can_remove_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls_with_headers, [('POST', '/v1/a', {
+            'X-Undelete-Enabled': 'yes',
+            'X-Account-Sysmeta-Undelete-Enabled': 'True',
+            'Host': 'localhost:80'})])
+
+    @with_req('/v1/a', 'POST')
+    def test_account_passthrough_from_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK', 'headers': [(
+            'X-Account-Sysmeta-Undelete-Enabled', 'False')]}]
+
+        status, headers, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls, [('POST', '/v1/a')])
+
+        self.assertIn('X-Undelete-Enabled', headers)
+        self.assertEqual(headers['X-Undelete-Enabled'], 'False')
+        self.assertIn('X-Account-Sysmeta-Undelete-Enabled', headers)
+        self.assertEqual(headers['X-Account-Sysmeta-Undelete-Enabled'],
+                         'False')
+
+    @with_req('/v1/a', 'POST', {'x-undelete-enabled': 'foo'})
+    def test_account_no_passthrough_to_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls_with_headers, [('POST', '/v1/a', {
+            'X-Undelete-Enabled': 'foo',
+            'Host': 'localhost:80'})])
+
+    @with_req('/v1/a/c', 'PUT', {
+        'x-undelete-enabled': 'bar'}, as_superuser=True)
+    def test_container_passthrough_to_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls_with_headers, [('PUT', '/v1/a/c', {
+            'X-Undelete-Enabled': 'bar',
+            'X-Container-Sysmeta-Undelete-Enabled': 'False',
+            'Host': 'localhost:80'})])
+
+    @with_req('/v1/a/c', 'PUT', {
+        'x-undelete-enabled': 'default'}, as_superuser=True)
+    def test_container_can_remove_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls_with_headers, [('PUT', '/v1/a/c', {
+            'X-Undelete-Enabled': 'default',
+            'X-Container-Sysmeta-Undelete-Enabled': '',
+            'Host': 'localhost:80'})])
+
+    @with_req('/v1/a/c', 'GET')
+    def test_container_passthrough_from_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK', 'headers': [(
+            'X-Container-Sysmeta-Undelete-Enabled', 'True')]}]
+
+        status, headers, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls, [('GET', '/v1/a/c')])
+
+        self.assertIn('X-Undelete-Enabled', headers)
+        self.assertEqual(headers['X-Undelete-Enabled'], 'True')
+        self.assertIn('X-Container-Sysmeta-Undelete-Enabled', headers)
+        self.assertEqual(headers['X-Container-Sysmeta-Undelete-Enabled'],
+                         'True')
+
+    @with_req('/v1/a/c', 'PUT', {'x-undelete-enabled': 'no'})
+    def test_container_no_passthrough_to_sysmeta(self, req):
+        self.app.responses = [{'status': '200 OK'}]
+
+        status, _, _ = self.call_mware(req)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(self.app.calls_with_headers, [('PUT', '/v1/a/c', {
+            'X-Undelete-Enabled': 'no',
+            'Host': 'localhost:80'})])
 
 if __name__ == '__main__':
     unittest.main()
