@@ -328,13 +328,26 @@ class TestObjectDeletion(MiddlewareTestCase):
                           ('PUT', '/v1/a/.trash-elements-versions'),
                           ('PUT', '/v1/a/.trash-elements')])
 
-    def test_delete_from_trash(self):
+    def test_delete_from_trash_as_non_superuser(self):
+        """
+        Objects in trash containers can only be deleted by superusers.
+        """
+        self.app.responses = [{'status': '204 No Content'}]
+        req = swob.Request.blank('/v1/a/.trash-borkbork/bork')
+        req.method = 'DELETE'
+
+        status, headers, body = self.call_mware(req)
+        self.assertEqual(status, "403 Forbidden")
+        self.assertEqual(self.app.calls, [])
+
+    def test_delete_from_trash_as_superuser(self):
         """
         Objects in trash containers don't get saved.
         """
         self.app.responses = [{'status': '204 No Content'}]
         req = swob.Request.blank('/v1/a/.trash-borkbork/bork')
         req.method = 'DELETE'
+        req.environ['reseller_request'] = True
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
@@ -345,6 +358,7 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.undelete.block_trash_deletes = True
         req = swob.Request.blank('/v1/a/.trash-borkbork/bork')
         req.method = 'DELETE'
+        req.environ['reseller_request'] = True
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "405 Method Not Allowed")

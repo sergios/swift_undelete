@@ -176,6 +176,11 @@ class UndeleteMiddleware(object):
                 content_type="text/plain",
                 body=("Attempted to delete from a trash container, but "
                       "block_trash_deletes is enabled\n"))
+        elif self.is_trash(con) and not self.is_superuser(req.environ):
+            return swob.HTTPForbidden(
+                content_type="text/plain",
+                body=("Attempted to delete from a trash container, but "
+                      "user is not a superuser\n"))
         elif not self.should_save_copy(req.environ, con, obj):
             return self.app
 
@@ -215,6 +220,12 @@ class UndeleteMiddleware(object):
         Whether a container is a trash container or not
         """
         return con.startswith(self.trash_prefix)
+
+    def is_superuser(self, env):
+        """
+        Whether the request was made by a superuser or not
+        """
+        return bool(env.get('reseller_request'))
 
     def should_save_copy(self, env, con, obj):
         """
