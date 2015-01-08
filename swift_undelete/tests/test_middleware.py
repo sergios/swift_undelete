@@ -349,3 +349,6 @@ class TestObjectDeletion(MiddlewareTestCase):
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(self.app.calls, [])
+
+if __name__ == '__main__':
+    unittest.main()
