@@ -51,14 +51,14 @@ DEFAULT_TRASH_PREFIX = ".trash-"
 DEFAULT_TRASH_LIFETIME = 86400 * 90  # 90 days expressed in seconds
 
 
-# Helper method stolen from a pending Swift change in Gerrit.
-#
-# If it ever actually lands, import and use it instead of having this
-# duplication.
-def close_if_possible(maybe_closable):
-    close_method = getattr(maybe_closable, 'close', None)
-    if callable(close_method):
-        return close_method()
+try:
+    from swift.common.request_helpers import close_if_possible
+except ImportError:
+    # Pre-1.13.0 (ref. https://github.com/openstack/swift/commit/1f67eb7)
+    def close_if_possible(maybe_closable):
+        close_method = getattr(maybe_closable, 'close', None)
+        if callable(close_method):
+            return close_method()
 
 
 def friendly_error(orig_error):
