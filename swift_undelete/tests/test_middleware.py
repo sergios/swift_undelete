@@ -15,7 +15,9 @@
 # limitations under the License.
 
 
+from functools import wraps
 import unittest
+
 from swift.common import swob
 from swift_undelete import middleware as md
 
@@ -130,6 +132,7 @@ class MiddlewareTestCase(unittest.TestCase):
 
 def with_req(path, method, headers=None, as_superuser=False):
     def decorator(func):
+        @wraps(func)
         def wrapped(*args, **kwargs):
             req = swob.Request.blank(path)
             req.method = method
