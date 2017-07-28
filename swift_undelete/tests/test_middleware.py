@@ -234,8 +234,7 @@ class TestObjectDeletion(MiddlewareTestCase):
                  'status': 200, 'sysmeta': {}}}},
             # container HEAD request
             {'status': '200 OK',
-             'environ': {'swift.container/MY_account/cats': {
-                 'status': 200, 'sysmeta': {'undelete-enabled': 'False'}}}},
+             'headers': [('X-Container-Sysmeta-Undelete-enabled', 'False')]},
             # DELETE request
             {'status': '204 No Content',
              'headers': [('X-Decadation', 'coprose')]}]
@@ -244,7 +243,7 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertEqual(status, "204 No Content")
         self.assertEqual(headers['X-Decadation'], 'coprose')
 
-        self.assertEqual(3, len(self.app.calls))
+        self.assertEqual(3, len(self.app.calls), self.app.calls)
 
         # First, we check that the account and container for opt-out
         method, path = self.app.calls[0]
@@ -267,8 +266,7 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.app.responses = [
             # account HEAD request
             {'status': '200 OK',
-             'environ': {'swift.account/MY_account': {
-                 'status': 200, 'sysmeta': {'undelete-enabled': 'False'}}}},
+             'headers': [('X-Account-Sysmeta-Undelete-enabled', 'False')]},
             # container HEAD request
             {'status': '200 OK',
              'environ': {'swift.container/MY_account/cats': {
@@ -281,7 +279,7 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertEqual(status, "204 No Content")
         self.assertEqual(headers['X-Decadation'], 'coprose')
 
-        self.assertEqual(3, len(self.app.calls))
+        self.assertEqual(3, len(self.app.calls), self.app.calls)
 
         # First, we check that the account and container for opt-out
         method, path = self.app.calls[0]
