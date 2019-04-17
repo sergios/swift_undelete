@@ -16,7 +16,7 @@
 
 from setuptools import setup, find_packages
 
-version = "__VERSION__"
+version = "0.0.7"
 
 setup(
     name="swift_undelete",
