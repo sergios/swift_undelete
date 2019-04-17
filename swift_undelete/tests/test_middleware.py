@@ -21,6 +21,8 @@ import unittest
 from swift.common import swob
 from swift_undelete import middleware as md
 
+from mock import patch
+
 
 class FakeApp(object):
     def __init__(self):
@@ -183,7 +185,8 @@ class TestPassthrough(MiddlewareTestCase):
 
 class TestObjectDeletion(MiddlewareTestCase):
     @with_req('/v1/a/elements/Cf', 'DELETE')
-    def test_deleting_nonexistent_object(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_deleting_nonexistent_object(self, mock_copy, req):
         # If the object isn't there, ignore the 404 on COPY and pass the
         # DELETE request through. It might be an expired object, in which case
         # the object DELETE will actually get it out of the container listing
@@ -197,21 +200,19 @@ class TestObjectDeletion(MiddlewareTestCase):
             {'status': '200 OK',
              'environ': {'swift.container/a/elements': {
                  'status': 200, 'sysmeta': {}}}},
-            # COPY request
-            {'status': '404 Not Found'},
-            # trash-versions container creation request
-            #
-            # Ideally we'd skip this stuff, but we can't tell the difference
-            # between object-not-found (404) and
-            # destination-container-not-found (also 404).
-            {'status': '202 Accepted'},
-            # trash container creation request
-            {'status': '202 Accepted'},
-            # second COPY attempt:
-            {'status': '404 Not Found'},
             # DELETE request
             {'status': '404 Not Found',
              'headers': [('X-Exophagous', 'ungrassed')]}]
+
+        mock_copy.return_value.status_code = 404
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "404 Not Found")
@@ -219,11 +220,8 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertEqual(self.app.calls, [
             ('HEAD', '/v1/a'),
             ('HEAD', '/v1/a/elements'),
-            ('COPY', '/v1/a/elements/Cf'),
-            ('PUT', '/v1/a/.trash-elements-versions'),
-            ('PUT', '/v1/a/.trash-elements'),
-            ('COPY', '/v1/a/elements/Cf'),
-            ('DELETE', '/v1/a/elements/Cf')])
+            ('DELETE', '/v1/a/elements/Cf')
+        ])
 
     @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
     def test_delete_with_opted_out_container(self, req):
@@ -299,7 +297,8 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
 
     @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
-    def test_copy_to_existing_trash_container(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_copy_to_existing_trash_container(self, mock_copy, req):
         self.undelete.trash_lifetime = 1997339
         self.app.responses = [
             # account HEAD request
@@ -310,12 +309,19 @@ class TestObjectDeletion(MiddlewareTestCase):
             {'status': '200 OK',
              'environ': {'swift.container/MY_account/cats': {
                  'status': 200, 'sysmeta': {}}}},
-            # COPY request
-            {'status': '201 Created',
-             'headers': [('X-Sir-Not-Appearing-In-This-Response', 'yup')]},
             # DELETE request
             {'status': '204 No Content',
              'headers': [('X-Decadation', 'coprose')]}]
+
+        mock_copy.return_value.status_code = 204
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
 
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
@@ -323,7 +329,7 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertNotIn('X-Sir-Not-Appearing-In-This-Response', headers)
         self.assertEqual(headers['X-Decadation'], 'coprose')
 
-        self.assertEqual(4, len(self.app.calls))
+        self.assertEqual(3, len(self.app.calls))
 
         # First, we check that the account and container haven't opted out
         method, path = self.app.calls[0]
@@ -334,21 +340,15 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertEqual(method, 'HEAD')
         self.assertEqual(path, '/v1/MY_account/cats')
 
-        # Second, we performed a COPY request to save the object into the trash
-        method, path, headers = self.app.calls_with_headers[2]
-        self.assertEqual(method, 'COPY')
-        self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
-        self.assertEqual(headers['Destination'], '.trash-cats/kittens.jpg')
-        self.assertEqual(headers['X-Delete-After'], str(1997339))
-
         # Finally, we actually perform the DELETE request (and send that
         # response to the client unaltered)
-        method, path, headers = self.app.calls_with_headers[3]
+        method, path, headers = self.app.calls_with_headers[2]
         self.assertEqual(method, 'DELETE')
         self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
 
     @with_req('/v1/MY_account/cats/kittens.jpg', 'DELETE')
-    def test_copy_to_existing_trash_container_no_expiration(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_copy_to_existing_trash_container_no_expiration(self, mock_copy, req):
         self.undelete.trash_lifetime = 0
         self.app.responses = [
             # account HEAD request
@@ -359,14 +359,22 @@ class TestObjectDeletion(MiddlewareTestCase):
             {'status': '200 OK',
              'environ': {'swift.container/MY_account/cats': {
                  'status': 200, 'sysmeta': {}}}},
-            # COPY request
-            {'status': '201 Created'},
             # DELETE request
             {'status': '204 No Content'}]
 
+        mock_copy.return_value.status_code = 204
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
+
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "204 No Content")
-        self.assertEqual(4, len(self.app.calls))
+        self.assertEqual(3, len(self.app.calls))
 
         # First, we check that the account and container haven't opted out
         method, path = self.app.calls[0]
@@ -378,12 +386,13 @@ class TestObjectDeletion(MiddlewareTestCase):
         self.assertEqual(path, '/v1/MY_account/cats')
 
         method, path, headers = self.app.calls_with_headers[2]
-        self.assertEqual(method, 'COPY')
+        self.assertEqual(method, 'DELETE')
         self.assertEqual(path, '/v1/MY_account/cats/kittens.jpg')
-        self.assertNotIn('X-Delete-After', headers)
+        self.assertNotIn('X-Delete-At', headers)
 
     @with_req('/v1/a/elements/Lv', 'DELETE')
-    def test_copy_to_missing_trash_container(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_copy_to_missing_trash_container(self, mock_copy, req):
         self.app.responses = [
             # account HEAD request
             {'status': '200 OK',
@@ -393,30 +402,32 @@ class TestObjectDeletion(MiddlewareTestCase):
             {'status': '200 OK',
              'environ': {'swift.container/a/elements': {
                  'status': 200, 'sysmeta': {}}}},
-            # first COPY attempt: trash container doesn't exist
-            {'status': '404 Not Found'},
-            # trash-versions container creation request
-            {'status': '201 Created'},
-            # trash container creation request
-            {'status': '201 Created'},
-            # second COPY attempt:
+            # COPY: trash container doesn't exist
             {'status': '404 Not Found'},
             # DELETE request
             {'status': '204 No Content'}]
 
+        mock_copy.return_value.status_code = 404
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
+
         status, headers, body = self.call_mware(req)
-        self.assertEqual(status, "204 No Content")
+        self.assertEqual(status, "404 Not Found")
         self.assertEqual(self.app.calls, [
             ('HEAD', '/v1/a'),
             ('HEAD', '/v1/a/elements'),
-            ('COPY', '/v1/a/elements/Lv'),
-            ('PUT', '/v1/a/.trash-elements-versions'),
-            ('PUT', '/v1/a/.trash-elements'),
-            ('COPY', '/v1/a/elements/Lv'),
-            ('DELETE', '/v1/a/elements/Lv')])
+            ('DELETE', '/v1/a/elements/Lv')
+        ])
 
     @with_req('/v1/a/elements/Te', 'DELETE')
-    def test_copy_error(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_copy_error(self, mock_copy, req):
         self.app.responses = [
             # account HEAD request
             {'status': '200 OK',
@@ -431,17 +442,30 @@ class TestObjectDeletion(MiddlewareTestCase):
              'headers': [('X-Scraggedness', 'Goclenian')],
              'body_iter': ['dunno what happened boss']}]
 
+        mock_copy.return_value.status_code = 503
+        mock_copy.return_value.headers = {'X-Scraggedness': 'Goclenian'}
+        mock_copy.return_value.content = 'dunno what happened boss'
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
+
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "503 Service Unavailable")
         self.assertEqual(headers.get('X-Scraggedness'), 'Goclenian')
         self.assertIn('what happened', body)
         self.assertEqual(self.app.calls, [
             ('HEAD', '/v1/a'),
-            ('HEAD', '/v1/a/elements'),
-            ('COPY', '/v1/a/elements/Te')])
+            ('HEAD', '/v1/a/elements')
+        ])
 
     @with_req('/v1/a/elements/U', 'DELETE')
-    def test_copy_missing_trash_cont_error_creating_vrs_container(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_copy_missing_trash_cont_error_creating_vrs_container(self, mock_copy, req):
         self.app.responses = [
             # account HEAD request
             {'status': '200 OK',
@@ -458,18 +482,30 @@ class TestObjectDeletion(MiddlewareTestCase):
              'headers': [('X-Pupillidae', 'Barry')],
              'body_iter': ['oh hell no']}]
 
+        mock_copy.return_value.status_code = 403
+        mock_copy.return_value.headers = {'X-Pupillidae': 'Barry'}
+        mock_copy.return_value.content = 'oh hell no'
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
+
         status, headers, body = self.call_mware(req)
         self.assertEqual(status, "403 Forbidden")
         self.assertEqual(headers.get('X-Pupillidae'), 'Barry')
         self.assertIn('oh hell no', body)
         self.assertEqual(self.app.calls, [
             ('HEAD', '/v1/a'),
-            ('HEAD', '/v1/a/elements'),
-            ('COPY', '/v1/a/elements/U'),
-            ('PUT', '/v1/a/.trash-elements-versions')])
+            ('HEAD', '/v1/a/elements')
+        ])
 
     @with_req('/v1/a/elements/Mo', 'DELETE')
-    def test_copy_missing_trash_container_error_creating_container(self, req):
+    @patch('swift_undelete.middleware.requests.request')
+    def test_copy_missing_trash_container_error_creating_container(self, mock_copy, req):
         self.app.responses = [
             # account HEAD request
             {'status': '200 OK',
@@ -484,20 +520,30 @@ class TestObjectDeletion(MiddlewareTestCase):
             # trash-versions container creation request
             {'status': '201 Created'},
             # trash container creation request: fails!
-            {'status': "418 I'm a teapot",
+            {'status': "417 Expectation Failed",
              'headers': [('X-Body-Type', 'short and stout')],
              'body_iter': ['here is my handle, here is my spout']}]
 
+        mock_copy.return_value.status_code = 417
+        mock_copy.return_value.headers = {'X-Body-Type': 'short and stout'}
+        mock_copy.return_value.content = 'here is my handle, here is my spout'
+
+        req.environ.update({
+            'keystone.token_info': {
+                'token': {
+                    'auth_token': 'gAAAAABcq0qaq6RFJVkEakf628FFgSz'
+                }
+            }
+        })
+
         status, headers, body = self.call_mware(req)
-        self.assertEqual(status, "418 I'm a teapot")
+        self.assertEqual(status, "417 Expectation Failed")
         self.assertEqual(headers.get('X-Body-Type'), 'short and stout')
         self.assertIn('spout', body)
         self.assertEqual(self.app.calls, [
             ('HEAD', '/v1/a'),
-            ('HEAD', '/v1/a/elements'),
-            ('COPY', '/v1/a/elements/Mo'),
-            ('PUT', '/v1/a/.trash-elements-versions'),
-            ('PUT', '/v1/a/.trash-elements')])
+            ('HEAD', '/v1/a/elements')
+        ])
 
     @with_req('/v1/a/.trash-borkbork/bork', 'DELETE')
     def test_delete_from_trash_as_non_superuser(self, req):

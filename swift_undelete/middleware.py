@@ -45,10 +45,16 @@ Future work:
    OPTIONS responses and any other 405 response).
 
 """
+import requests
+import time
+
+from datetime import datetime, timedelta
+
 from swift.common import http, swob, utils, wsgi
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.proxy.controllers.base import get_account_info, get_container_info
 
+PROTOCOL = "https"
 DEFAULT_TRASH_PREFIX = ".trash-"
 DEFAULT_TRASH_LIFETIME = 86400 * 90  # 90 days expressed in seconds
 SYSMETA_UNDELETE_ENABLED = "undelete-enabled"
@@ -75,38 +81,28 @@ class ContainerContext(wsgi.WSGIContext):
     Helper class to perform a container PUT request.
     """
 
-    def create(self, env, vrs, account, container, versions=None):
+    def create(self, env, account, container, versions=None):
         """
         Perform a container PUT request
 
         :param env: WSGI environment for original request
-        :param vrs: API version, e.g. "v1"
         :param account: account in which to create the container
         :param container: container name
-        :param versions: value for X-Versions-Location header
-            (for container versioning)
+        :param versions: value for X-Versions-Location header (for container versioning)
 
         :returns: None
         :raises: HTTPException on failure (non-2xx response)
         """
-        env = env.copy()
-        env['REQUEST_METHOD'] = 'PUT'
-        env["PATH_INFO"] = "/%s/%s/%s" % (vrs, account, container)
+        host = env.headers['Host']
+        path_info = "/".join(env.environ['PATH_INFO'].split('/')[1:3])
+        token = env.environ['keystone.token_info']['token']['auth_token']
+        url = "%s://%s/%s/%s" % (PROTOCOL, host, path_info, container)
+        headers = {"X-Auth-Token": token}
+
         if versions:
-            env['HTTP_X_VERSIONS_LOCATION'] = versions
+            headers["X-Versions-Location"] = versions
 
-        resp_iter = self._app_call(env)
-        # The body of a PUT response is either empty or very short (e.g. error
-        # message), so we can get away with slurping the whole thing.
-        body = ''.join(resp_iter)
-        close_if_possible(resp_iter)
-
-        status_int = int(self._response_status.split(' ', 1)[0])
-        if not http.is_success(status_int):
-            raise swob.HTTPException(
-                status=self._response_status,
-                headers=self._response_headers,
-                body=friendly_error(body))
+        return requests.request('PUT', headers=headers, url=url)
 
 
 class CopyContext(wsgi.WSGIContext):
@@ -119,39 +115,31 @@ class CopyContext(wsgi.WSGIContext):
         """
         Perform a COPY from source to destination.
 
-        :param env: WSGI environment for a request aimed at the source
-            object.
+        :param env: WSGI environment for a request aimed at the source object.
         :param destination_container: container to copy into.
-            Note: this must not contain any slashes or the request is
-            guaranteed to fail.
+            Note: this must not contain any slashes or the request is guaranteed to fail.
         :param destination_object: destination object name
-        :param delete_after: value of X-Delete-After; object will be deleted
+        :param delete_after: value of X-Delete-At; object will be deleted
                              after that many seconds have elapsed. Set to 0 or
                              None to keep the object forever.
 
         :returns: 3-tuple (HTTP status code, response headers,
                            full response body)
         """
-        env = env.copy()
-        env['REQUEST_METHOD'] = 'COPY'
-        env['HTTP_DESTINATION'] = '/'.join(
-            (destination_container, destination_object))
-        qs = env.get('QUERY_STRING', '')
-        if qs:
-            qs += '&multipart-manifest=get'
-        else:
-            qs = 'multipart-manifest=get'
-        env['QUERY_STRING'] = qs
-        if delete_after:
-            env['HTTP_X_DELETE_AFTER'] = str(delete_after)
-        resp_iter = self._app_call(env)
-        # The body of a COPY response is either empty or very short (e.g.
-        # error message), so we can get away with slurping the whole thing.
-        body = ''.join(resp_iter)
-        close_if_possible(resp_iter)
+        host = env.headers['Host']
+        path_info = env.environ['PATH_INFO']
+        url = "%s://%s%s" % (PROTOCOL, host, path_info)
 
-        status_int = int(self._response_status.split(' ', 1)[0])
-        return (status_int, self._response_headers, body)
+        token = env.environ['keystone.token_info']['token']['auth_token']
+        destination = '/'.join((destination_container, destination_object))
+        headers = {"X-Auth-Token": token, "Destination": destination}
+
+        if delete_after:
+            delete_at = datetime.now() + timedelta(seconds=delete_after)
+            unix_time = int(time.mktime(delete_at.timetuple()))
+            headers["X-Delete-At"] = str(unix_time)
+
+        return requests.request('COPY', headers=headers, url=url)
 
 
 class UndeleteMiddleware(object):
@@ -204,18 +192,17 @@ class UndeleteMiddleware(object):
             return self.app
 
         trash_container = self.trash_prefix + con
-        copy_status, copy_headers, copy_body = self.copy_object(
-            req, trash_container, obj)
-        if copy_status == 404:
-            self.create_trash_container(req, vrs, acc, trash_container)
-            copy_status, copy_headers, copy_body = self.copy_object(
-                req, trash_container, obj)
-        elif not http.is_success(copy_status):
+        response = self.copy_object(req, trash_container, obj)
+
+        if response.status_code == 404:
+            self.create_trash_container(req, acc, trash_container)
+            response = self.copy_object(req, trash_container, obj)
+        elif not http.is_success(response.status_code):
             # other error; propagate this to the client
             return swob.Response(
-                body=friendly_error(copy_body),
-                status=copy_status,
-                headers=copy_headers)
+                body=friendly_error(response.content),
+                status=response.status_code,
+                headers=response.headers)
         return self.app
 
     def translate_sysmeta_and_complete(self, req, mapping):
@@ -245,10 +232,10 @@ class UndeleteMiddleware(object):
         return resp
 
     def copy_object(self, req, trash_container, obj):
-        return CopyContext(self.app).copy(req.environ, trash_container, obj,
+        return CopyContext(self.app).copy(req, trash_container, obj,
                                           self.trash_lifetime)
 
-    def create_trash_container(self, req, vrs, account, trash_container):
+    def create_trash_container(self, req, account, trash_container):
         """
         Create a trash container and its associated versions container.
 
@@ -256,8 +243,8 @@ class UndeleteMiddleware(object):
         """
         ctx = ContainerContext(self.app)
         versions_container = trash_container + "-versions"
-        ctx.create(req.environ, vrs, account, versions_container)
-        ctx.create(req.environ, vrs, account, trash_container,
+        ctx.create(req, account, versions_container)
+        ctx.create(req, account, trash_container,
                    versions=versions_container)
 
     def is_trash(self, con):
