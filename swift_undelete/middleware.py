@@ -126,7 +126,6 @@ class CopyContext(wsgi.WSGIContext):
         :returns: 3-tuple (HTTP status code, response headers,
                            full response body)
         """
-        host = env.headers['Host']
         path_info = env.environ['PATH_INFO']
         url = "http://%s:%s%s" % (HOST, PORT, path_info)
 
