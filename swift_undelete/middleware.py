@@ -54,7 +54,8 @@ from swift.common import http, swob, utils, wsgi
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.proxy.controllers.base import get_account_info, get_container_info
 
-PROTOCOL = "https"
+HOST = "localhost"
+PORT = "8081"
 DEFAULT_TRASH_PREFIX = ".trash-"
 DEFAULT_TRASH_LIFETIME = 86400 * 90  # 90 days expressed in seconds
 SYSMETA_UNDELETE_ENABLED = "undelete-enabled"
@@ -93,10 +94,9 @@ class ContainerContext(wsgi.WSGIContext):
         :returns: None
         :raises: HTTPException on failure (non-2xx response)
         """
-        host = env.headers['Host']
         path_info = "/".join(env.environ['PATH_INFO'].split('/')[1:3])
         token = env.environ['keystone.token_info']['token']['auth_token']
-        url = "%s://%s/%s/%s" % (PROTOCOL, host, path_info, container)
+        url = "http://%s:%s/%s/%s" % (HOST, PORT, path_info, container)
         headers = {"X-Auth-Token": token}
 
         if versions:
@@ -128,7 +128,7 @@ class CopyContext(wsgi.WSGIContext):
         """
         host = env.headers['Host']
         path_info = env.environ['PATH_INFO']
-        url = "%s://%s%s" % (PROTOCOL, host, path_info)
+        url = "http://%s:%s%s" % (HOST, PORT, path_info)
 
         token = env.environ['keystone.token_info']['token']['auth_token']
         destination = '/'.join((destination_container, destination_object))
